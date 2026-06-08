@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TransformStamped, Point
+from control_msgs.msg import JointJog
 from quest2ros.msg import OVR2ROSInputs
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
@@ -12,6 +13,8 @@ import time
 # ROS 2 action client and gripper action message
 from rclpy.action import ActionClient
 from control_msgs.action import GripperCommand
+from control_msgs.action import ParallelGripperCommand
+from moveit_msgs.srv import ServoCommandType
 
 # Deque for efficient fixed-length queues
 from collections import deque
@@ -88,6 +91,7 @@ class BaseArmController(Node):
         self.current_robot_pose = None  # Current EEF position (from TF)
         self.allow_pose_update = True   # Enable/disable arm motion (toggled in inputs callback)
         self.is_gripper_closed = False  # Gripper state
+        self._was_jogging = False  # Flag para enviar o comando de parada (0.0)
         
     def _init_interfaces(self):
         #Initialize publisher,subscriber,TF,gripper
@@ -122,12 +126,23 @@ class BaseArmController(Node):
             10
         )
 
+        # Publisher para o controle analógico (JointJog)
+        self.joint_jog_pub = self.create_publisher(
+            JointJog, 
+            '/servo_node/delta_joint_cmds', 
+            10
+        )
+
         #Publisher
         self.marker_pub = self.create_publisher(Marker, '/visualization_marker', 10)
         self.target_pose_publisher = self.create_publisher(PoseStamped, self.robot_target_pose_topic, 10)
 
+        # Cliente para alterar o tipo de comando do MoveIt Servo
+        self.servo_type_client = self.create_client(ServoCommandType, '/servo_node/switch_command_type')
+
         # Gripper action client
-        self.gripper_action_client = ActionClient(self, GripperCommand, self.gripper_action_topic)
+        # self.gripper_action_client = ActionClient(self, GripperCommand, self.gripper_action_topic)
+        self.gripper_action_client = ActionClient(self, ParallelGripperCommand, self.gripper_action_topic)
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Waiting for gripper action server: {self.gripper_action_topic}")
 
         self.get_logger().info(f'[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Ready to receive {self.quest_pose_topic} and publish to {self.robot_target_pose_topic}')
@@ -206,8 +221,7 @@ class BaseArmController(Node):
         avg_orientation /= norm
 
         return avg_position, avg_orientation
-
-
+      
     def _pose_callback(self, pose_stamped: PoseStamped):
         """
         Callback for Quest hand PoseStamped messages.
@@ -243,35 +257,74 @@ class BaseArmController(Node):
             )
             return 
 
-        offset_x = avg_quest_pos_np[0] - self.first_received_quest_position[0]
-        offset_y = avg_quest_pos_np[1] - self.first_received_quest_position[1]
-        offset_z = avg_quest_pos_np[2] - self.first_received_quest_position[2]
+        # ======================================================================
+        # CÁLCULO DE OFFSET: ALINHAMENTO DINÂMICO DE EIXOS (MATRIZ DE ROTAÇÃO)
+        # ======================================================================
+        # 1. Offset bruto (translação pura no referencial físico do seu Quest)
+        raw_offset_x = avg_quest_pos_np[0] - self.first_received_quest_position[0]
+        raw_offset_y = avg_quest_pos_np[1] - self.first_received_quest_position[1]
+        offset_z = avg_quest_pos_np[2] - self.first_received_quest_position[2] 
 
+        # 2. Extrair o ângulo Yaw do Quest no momento da ancoragem
+        _, _, yaw_quest = tf_transformations.euler_from_quaternion([
+            self.first_received_quest_orientation[0],
+            self.first_received_quest_orientation[1],
+            self.first_received_quest_orientation[2],
+            self.first_received_quest_orientation[3]
+        ])
+        
+        # 3. Extrair o ângulo Yaw do Robô no momento da ancoragem
+        _, _, yaw_robot = tf_transformations.euler_from_quaternion([
+            self.initial_orientation.x,
+            self.initial_orientation.y,
+            self.initial_orientation.z,
+            self.initial_orientation.w
+        ])
+
+        # 4. Diferença de ângulo (Deslocamento entre os dois referenciais)
+        delta_yaw = yaw_robot - yaw_quest
+
+        # 5. Rotacionar o vetor de movimento usando Matriz de Rotação em 2D (rotação do plano xy)
+        cos_yaw = np.cos(delta_yaw)
+        sin_yaw = np.sin(delta_yaw)
+
+        # Aplicação da Matriz de Rotação
+        offset_x = (raw_offset_x * cos_yaw) - (raw_offset_y * sin_yaw)
+        offset_y = (raw_offset_x * sin_yaw) + (raw_offset_y * cos_yaw)
+
+        # ======================================================================
+        # 6. Cálculo da orientação RELATIVA LOCAL 
+        # ======================================================================
         q_quest_initial_np = self.first_received_quest_orientation
         q_quest_current_np = avg_quest_ori_np
 
         q_quest_initial_inv = tf_transformations.quaternion_inverse(q_quest_initial_np)
-        q_quest_relative_rotation = tf_transformations.quaternion_multiply(q_quest_current_np, q_quest_initial_inv)
+        
+        # MUDANÇA 1: q_init_inv * q_curr = Extrai a rotação no referencial LOCAL da mão 
+        q_local_relative_rotation = tf_transformations.quaternion_multiply(q_quest_initial_inv, q_quest_current_np)
 
         q_robot_initial_np = np.array([self.initial_orientation.x, 
                                        self.initial_orientation.y,
                                        self.initial_orientation.z, 
                                        self.initial_orientation.w])
         
-        q_target_robot_np = tf_transformations.quaternion_multiply(q_quest_relative_rotation, q_robot_initial_np)
+        # MUDANÇA 2: q_robot_init * q_local_rel = Aplica a rotação local "em cima" da orientação que o robô já estava
+        q_target_robot_np = tf_transformations.quaternion_multiply(q_robot_initial_np, q_local_relative_rotation)
+        
+        # Normalização de segurança
         q_target_robot_np /= np.linalg.norm(q_target_robot_np)
 
+        # 7. Construção da Pose final com translação e rotação corrigidas
         target_pose = Pose()
-        target_pose.position.x = self.initial_position[0] + offset_x
-        target_pose.position.y = self.initial_position[1] + offset_y
+        target_pose.position.x = self.initial_position[0] + offset_x # offset_x vem da Matriz de Rotação 2D
+        target_pose.position.y = self.initial_position[1] + offset_y # offset_y também
         target_pose.position.z = self.initial_position[2] + offset_z
-
-        self.get_logger().info(f"x {target_pose.position.x:.4f} y {target_pose.position.y:.4f} z {target_pose.position.z:.4f}")
         target_pose.orientation.x = q_target_robot_np[0]
         target_pose.orientation.y = q_target_robot_np[1]
         target_pose.orientation.z = q_target_robot_np[2]
         target_pose.orientation.w = q_target_robot_np[3]
 
+        self.get_logger().info(f"x {target_pose.position.x:.4f} y {target_pose.position.y:.4f} z {target_pose.position.z:.4f}")
 
         # Visualization markers
         axes_marker = Marker()
@@ -305,38 +358,33 @@ class BaseArmController(Node):
         target_pose_stamped.pose = target_pose
         self.target_pose_publisher.publish(target_pose_stamped)
         self.last_executed_target_pose = target_pose
-        self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Published new target pose.")
-    
+
     def _toggle_gripper(self):
         """
         Toggle the gripper: send an action goal to open or close it depending on
         the current state. Updates internal state after the action completes.
         """
-        if not self.gripper_action_client.wait_for_server(timeout_sec=1.0):
+        if not self.gripper_action_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Gripper action server not available.")
             return
 
-        goal_msg = GripperCommand.Goal()
-
+        # goal_msg = GripperCommand.Goal()
+        goal_msg = ParallelGripperCommand.Goal()
+                    
         if self.is_gripper_closed:
-            goal_msg.command.position = 0.0 # 0.0 Fully open
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.position = [0.0] # 0.0 Fully open
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
         else:
-            goal_msg.command.position = 0.05 # 0.05 Fully closed
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.position = [0.04] # 0.04 Fully closed
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
 
-        # Send goal and update state
+        # Send goal and update state    
         self.gripper_action_client.send_goal_async(goal_msg)
         self.is_gripper_closed = not self.is_gripper_closed
 
     def _inputs_callback(self, msg: OVR2ROSInputs):
         """
         Callback for Quest 3 controller inputs.
-
-        - Upper button (button_upper): toggle gripper open/close.
-        - Lower button (button_lower): toggle pose streaming on/off and recenter anchors.
         """
         # Ensure edge-detection flags exist (one action per press)
         if not hasattr(self, '_button_upper_pressed_state'):
@@ -344,32 +392,49 @@ class BaseArmController(Node):
         if not hasattr(self, '_button_lower_pressed_state'):
             self._button_lower_pressed_state = False
 
-        # Upper button: Toggle gripper
+        # ---------------------------------------------------------
+        # 1. Upper button: Toggle gripper
+        # ---------------------------------------------------------
         if msg.button_upper and not self._button_upper_pressed_state:
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Upper button pressed. Toggling gripper...")
             self._toggle_gripper()
             
-        # Update upper button press state
         self._button_upper_pressed_state = msg.button_upper
 
-        # Lower button: Toggle pose updates and re-anchor
+        # ---------------------------------------------------------
+        # 2. Lower button: Toggle pose updates and re-anchor
+        # ---------------------------------------------------------
         if msg.button_lower and not self._button_lower_pressed_state:
             # Flip the pose-streaming gate
             self.allow_pose_update = not self.allow_pose_update
             
-            state_msg = "ENABLED (publishing poses)" if self.allow_pose_update else "DISABLED (hold position)"
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button pressed: pose streaming is now **{state_msg}**。")
+            # ==============================================================
+            # TROCAR O MODO DO MOVEIT SERVO DINAMICAMENTE
+            # ==============================================================
+            if self.servo_type_client.wait_for_service(timeout_sec=0.5):
+                req = ServoCommandType.Request()
+                
+                if self.allow_pose_update:
+                    req.command_type = 2  # Modo POSE
+                    state_msg = "ENABLED (publishing poses)"
+                else:
+                    req.command_type = 0  # Modo JOINT_JOG (Analógico)
+                    state_msg = "DISABLED (hold position / analog mode)"
+                    
+                self.servo_type_client.call_async(req)
+                self.get_logger().info(f"MoveIt Servo alterado para o modo: {req.command_type}")
+            else:
+                state_msg = "ERRO: Serviço do Servo não encontrado"
+            # ==============================================================
+            
+            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button pressed: pose streaming is now **{state_msg}**.")
             
             robot_pos, robot_ori = self._get_robot_current_pose()
-            
-            if self.last_pose_stamped_always is not None:
-                pass
 
             if robot_pos is not None and robot_ori is not None:
                 # Set robot anchor to the current EEF pose
                 self.initial_position = robot_pos
                 self.initial_orientation = robot_ori
-                self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Robot anchor reset to current pose. ")
                 
                 # Force _pose_callback to re-anchor Quest on the next smoothed sample
                 self.initial_orientation = None 
@@ -379,6 +444,59 @@ class BaseArmController(Node):
             # Clear filter history
             self.position_history.clear()
             self.orientation_history.clear()
+
+        # Update lower button press state
+        self._button_lower_pressed_state = msg.button_lower
+
+        # ---------------------------------------------------------
+        # 3. Controle Analógico (Roda continuamente)
+        # ---------------------------------------------------------
+        if not self.allow_pose_update:
+        
+            DEADZONE = 0.15 # drift do analógico
+            MAX_VELOCITY = 0.8 #  rad/s 
+            
+            analog_x = msg.thumb_stick_horizontal 
+            
+            jog_msg = JointJog()
+            jog_msg.header.stamp = self.get_clock().now().to_msg()
+            jog_msg.header.frame_id = self.base_frame_id
+            jog_msg.joint_names = ['joint_0'] # base_link
+            
+            if abs(analog_x) > DEADZONE:
+                # Mapeia o valor do analógico para a velocidade
+                target_vel = analog_x * MAX_VELOCITY
+                jog_msg.velocities = [target_vel]
+                
+                self.joint_jog_pub.publish(jog_msg)
+                self._was_jogging = True
+                                    
+            elif self._was_jogging:
+                # O usuário soltou o analógico. Envia velocidade ZERO para parar o robô imediatamente
+                jog_msg.velocities = [0.0]
+                self.joint_jog_pub.publish(jog_msg)
+                self._was_jogging = False
+                self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Rotação da base finalizada. Atualizando âncoras...")
+
+                # ==============================================================
+                # RESET DE POSES (Evita pulos ao voltar para a teleoperação)
+                # ==============================================================
+                robot_pos, robot_ori = self._get_robot_current_pose()
+
+                if robot_pos is not None and robot_ori is not None:
+                    # Atualiza a posição inicial para a nova coordenada pós-rotação
+                    self.initial_position = robot_pos
+                    
+                    # Definir initial_orientation como None força o _pose_callback 
+                    # a reancorar o controle do Quest no próximo frame válido
+                    self.initial_orientation = None 
+                    self.first_received_quest_position = None
+                    self.first_received_quest_orientation = None
+
+                # Limpa o histórico do filtro para garantir uma leitura suave na retomada
+                self.position_history.clear()
+                self.orientation_history.clear()
+                # ==============================================================
 
         # Update lower button press state
         self._button_lower_pressed_state = msg.button_lower
