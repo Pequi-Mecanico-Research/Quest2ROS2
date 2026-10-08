@@ -17,10 +17,11 @@ from control_msgs.action import ParallelGripperCommand
 from moveit_msgs.srv import ServoCommandType
 
 # Deque for efficient fixed-length queues
+# melhor nas pontas 
 from collections import deque
 
 class BaseArmController(Node):
-    def __init__(self, arm_name: str,robot_name:str , mirror: bool, base_frame_id:str , filter_window_size: int , end_effector_link_name: str , ctrl_prefix: str , gripper_action_topic: str):
+    def __init__(self, arm_name: str, robot_name: str, mirror: bool, base_frame_id: str, filter_window_size: int, end_effector_link_name: str, ctrl_prefix: str, gripper_action_topic: str):
         """
         Base class for controlling a robot arm using Quest3 inputs.
 
@@ -60,7 +61,6 @@ class BaseArmController(Node):
         self.filter_window_size = filter_window_size
         self.end_effector_link_name = end_effector_link_name
         
-
         # Initialize parameter and interface
         self._init_parameters()
         self._init_variables()
@@ -92,15 +92,23 @@ class BaseArmController(Node):
         self.allow_pose_update = True   # Enable/disable arm motion (toggled in inputs callback)
         self.is_gripper_closed = False  # Gripper state
         self._was_jogging = False  # Flag para enviar o comando de parada (0.0)
-        
+
     def _init_interfaces(self):
         #Initialize publisher,subscriber,TF,gripper
+        # Os tópicos do lado do robô (servo, controllers, joint_states) são relativos: sem
+        # namespace resolvem para os mesmos nomes de antes (/servo_node/target_pose, ...);
+        # rodando com `--ros-args -r __ns:=/arm_left -r /tf:=tf -r /tf_static:=tf_static`
+        # o nó passa a comandar o braço daquele namespace (ver wxai_teleop.launch.py).
+        # Os tópicos do Quest (/q2r_*) continuam absolutos: são os mesmos para todos os braços.
         ctrl_prefix = self.ctrl_prefix
-        self.robot_target_pose_topic = f"{ctrl_prefix}/target_frame"
-
+        # self.robot_target_pose_topic = f"{ctrl_prefix}/target_frame"
+        self.robot_target_pose_topic = "servo_node/target_pose" # onde o moveit-servo recebe as poses (hard-coded)
         #Mirror
         quest_side = ("right" if self.arm_name == "left" else "left") if self.mirror else self.arm_name
-        
+        # Permite escolher em tempo de execução qual mão do Quest comanda este braço
+        # (ex.: dois braços wxai, mão esquerda -> arm_left e mão direita -> arm_right).
+        quest_side = self.declare_parameter("quest_hand", quest_side).value
+
         self.quest_pose_topic = f"/q2r_{quest_side}_hand_pose"
         self.quest_inputs_topic = f"/q2r_{quest_side}_hand_inputs"
         self.get_logger().info(f"Ready. Listening to: {self.quest_pose_topic}")
@@ -126,30 +134,28 @@ class BaseArmController(Node):
             10
         )
 
+
         # Publisher para o controle analógico (JointJog)
         self.joint_jog_pub = self.create_publisher(
             JointJog, 
-            '/servo_node/delta_joint_cmds', 
+            'servo_node/delta_joint_cmds',
             10
         )
 
         #Publisher
-        self.marker_pub = self.create_publisher(Marker, '/visualization_marker', 10)
+        self.marker_pub = self.create_publisher(Marker, 'visualization_marker', 10)
         self.target_pose_publisher = self.create_publisher(PoseStamped, self.robot_target_pose_topic, 10)
 
+
         # Cliente para alterar o tipo de comando do MoveIt Servo
-        self.servo_type_client = self.create_client(ServoCommandType, '/servo_node/switch_command_type')
+        self.servo_type_client = self.create_client(ServoCommandType, 'servo_node/switch_command_type')
 
         # Gripper action client
-        # self.gripper_action_client = ActionClient(self, GripperCommand, self.gripper_action_topic)
         self.gripper_action_client = ActionClient(self, ParallelGripperCommand, self.gripper_action_topic)
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Waiting for gripper action server: {self.gripper_action_topic}")
 
         self.get_logger().info(f'[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Ready to receive {self.quest_pose_topic} and publish to {self.robot_target_pose_topic}')
 
-
-
-        
     def _get_robot_current_pose(self) -> (tuple[tuple[float, float, float], Quaternion]   | tuple[None, None]):
         """
         Query TF2 for the current end-effector (EEF) pose expressed in the base frame.
@@ -187,7 +193,6 @@ class BaseArmController(Node):
             - avg_position: np.ndarray shape (3,) or None while warming up
             - avg_orientation: np.ndarray shape (4,) [x, y, z, w] or None while warming up
         """
-
         # Append latest samples to the fixed-length deques
         self.position_history.append(
             np.array([pose_stamped.pose.position.x, pose_stamped.pose.position.y, pose_stamped.pose.position.z])
@@ -203,7 +208,6 @@ class BaseArmController(Node):
                 f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
                 f"Filling filter... ({len(self.position_history)}/{self.filter_window_size})"
             )            
-        
             return None, None 
 
         # Compute mean position over the window
@@ -316,8 +320,8 @@ class BaseArmController(Node):
 
         # 7. Construção da Pose final com translação e rotação corrigidas
         target_pose = Pose()
-        target_pose.position.x = self.initial_position[0] + offset_x # offset_x vem da Matriz de Rotação 2D
-        target_pose.position.y = self.initial_position[1] + offset_y # offset_y também
+        target_pose.position.x = self.initial_position[0] + offset_x
+        target_pose.position.y = self.initial_position[1] + offset_y
         target_pose.position.z = self.initial_position[2] + offset_z
         target_pose.orientation.x = q_target_robot_np[0]
         target_pose.orientation.y = q_target_robot_np[1]
@@ -368,9 +372,8 @@ class BaseArmController(Node):
             self.get_logger().error(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Gripper action server not available.")
             return
 
-        # goal_msg = GripperCommand.Goal()
         goal_msg = ParallelGripperCommand.Goal()
-                    
+
         if self.is_gripper_closed:
             goal_msg.command.position = [0.0] # 0.0 Fully open
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
@@ -378,7 +381,7 @@ class BaseArmController(Node):
             goal_msg.command.position = [0.04] # 0.04 Fully closed
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
 
-        # Send goal and update state    
+        # Send goal and update state
         self.gripper_action_client.send_goal_async(goal_msg)
         self.is_gripper_closed = not self.is_gripper_closed
 
@@ -407,7 +410,7 @@ class BaseArmController(Node):
         if msg.button_lower and not self._button_lower_pressed_state:
             # Flip the pose-streaming gate
             self.allow_pose_update = not self.allow_pose_update
-            
+
             # ==============================================================
             # TROCAR O MODO DO MOVEIT SERVO DINAMICAMENTE
             # ==============================================================
@@ -437,7 +440,7 @@ class BaseArmController(Node):
                 self.initial_orientation = robot_ori
                 
                 # Force _pose_callback to re-anchor Quest on the next smoothed sample
-                self.initial_orientation = None 
+                self.initial_orientation = None
                 self.first_received_quest_position = None
                 self.first_received_quest_orientation = None
 
@@ -489,7 +492,7 @@ class BaseArmController(Node):
                     
                     # Definir initial_orientation como None força o _pose_callback 
                     # a reancorar o controle do Quest no próximo frame válido
-                    self.initial_orientation = None 
+                    self.initial_orientation = None
                     self.first_received_quest_position = None
                     self.first_received_quest_orientation = None
 
@@ -497,6 +500,3 @@ class BaseArmController(Node):
                 self.position_history.clear()
                 self.orientation_history.clear()
                 # ==============================================================
-
-        # Update lower button press state
-        self._button_lower_pressed_state = msg.button_lower
