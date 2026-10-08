@@ -5,7 +5,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TransformStamped, P
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from quest2ros.msg import OVR2ROSInputs
 from visualization_msgs.msg import Marker
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float64
 from sensor_msgs.msg import JointState
 from tf2_ros import TransformListener, Buffer
 import numpy as np
@@ -96,6 +96,16 @@ class BaseArmController(Node):
         self.is_gripper_closed = False  # Gripper state
         self._was_jogging = False  # Flag para enviar o comando de parada (0.0)
 
+        # [keep-alive] Último alvo publicado em cada canal de ação. O MoveIt Servo
+        # para de publicar em /arm_controller/joint_trajectory 0.5s após o último
+        # comando de entrada (incoming_command_timeout), e a garra só publicava na
+        # troca de estado. Como o Rosetta amostra numa grade fixa e preenche com
+        # ZEROS o canal que nunca recebeu mensagem, esses silêncios viravam ações
+        # fabricadas no dataset. Manter os dois canais sempre vivos evita isso.
+        self.last_executed_target_pose = None
+        self._last_gripper_target = 0.0  # coerente com is_gripper_closed = False (aberta)
+        self._keepalive_period_sec = 1.0 / 30.0 # talvez não deixar hard coded 
+
         # [ready/sleep command] Estado da transição suave (waypoints) até uma pose nomeada
         self.named_pose_joint_names = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5']
         self.current_joint_positions = {}  # Preenchido via /joint_states
@@ -157,6 +167,7 @@ class BaseArmController(Node):
         #Publisher
         self.marker_pub = self.create_publisher(Marker, 'visualization_marker', 10)
         self.target_pose_publisher = self.create_publisher(PoseStamped, self.robot_target_pose_topic, 10)
+        self.gripper_target_position_publisher = self.create_publisher(Float64, 'gripper_controller/target_position', 10) # para o rosetta
 
 
         # [ready/sleep command] Necessário para saber a posição de junta atual
@@ -184,7 +195,92 @@ class BaseArmController(Node):
         self.gripper_action_client = ActionClient(self, ParallelGripperCommand, self.gripper_action_topic)
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Waiting for gripper action server: {self.gripper_action_topic}")
 
+        # [keep-alive] Mantém os canais de ação publicando mesmo quando o operador
+        # está parado (ver _keepalive_tick).
+        self._keepalive_timer = self.create_timer(self._keepalive_period_sec, self._keepalive_tick)
+
         self.get_logger().info(f'[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Ready to receive {self.quest_pose_topic} and publish to {self.robot_target_pose_topic}')
+
+    def _keepalive_tick(self):
+        """
+        [keep-alive]
+        Realimenta os canais de ação para que eles nunca fiquem mudos.
+
+        Sem isso, o MoveIt Servo entra em timeout 0.5s após o último comando e
+        para de publicar em /arm_controller/joint_trajectory, e a garra fica sem
+        publicar até o operador apertar o botão. Como o Rosetta amostra numa
+        grade fixa de 30fps e zera o canal que ainda não recebeu nenhuma
+        mensagem, esses silêncios apareciam no dataset como ações fabricadas
+        (e como um degrau artificial quando a primeira mensagem real chegava).
+
+        Não comanda movimento novo: apenas repete o alvo corrente. Em modo jog o
+        comando repetido é velocidade zero, que é seguro por construção.
+        """
+        # Durante uma transição sleep/ready, a própria interpolação já publica em
+        # /arm_controller/joint_trajectory. Alimentar o Servo aqui colocaria dois
+        # publishers disputando o tópico do controlador.
+        if self._pose_transition_timer is not None:
+            return
+
+        self._republish_gripper_target()
+
+        if self.allow_pose_update:
+            self._republish_target_pose()
+        elif not self._was_jogging:
+            # Modo jog com analógico na deadzone: o _inputs_callback não publica
+            # nada, então o Servo precisa de um comando neutro para não expirar.
+            # Enquanto o operador realmente joga, _was_jogging é True e o callback
+            # já alimenta o Servo — não publicar aqui evita intercalar zeros no
+            # meio de um movimento em andamento.
+            self._publish_zero_jog()
+
+    def _republish_target_pose(self):
+        # [keep-alive] Repete o último alvo cartesiano conhecido. Antes da primeira
+        # ancoragem não existe alvo; nesse caso usa a pose atual do EEF, que o Servo
+        # interpreta como "fique onde está".
+        pose = self.last_executed_target_pose
+
+        if pose is None:
+            try:
+                transform: TransformStamped = self.tf_buffer.lookup_transform(
+                    self.base_frame_id, self.end_effector_link_name, rclpy.time.Time()
+                )
+            except Exception as e:
+                # TF ainda não disponível logo após o launch: throttle para não
+                # inundar o log a 30Hz.
+                self.get_logger().warn(
+                    f"[{self.arm_name.capitalize()} Arm] keep-alive sem alvo e sem TF: {e}",
+                    throttle_duration_sec=5.0,
+                )
+                return
+            pose = Pose()
+            pose.position.x = transform.transform.translation.x
+            pose.position.y = transform.transform.translation.y
+            pose.position.z = transform.transform.translation.z
+            pose.orientation = transform.transform.rotation
+
+        target_pose_stamped = PoseStamped()
+        target_pose_stamped.header.frame_id = self.base_frame_id
+        target_pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        target_pose_stamped.pose = pose
+        self.target_pose_publisher.publish(target_pose_stamped)
+
+    def _publish_zero_jog(self):
+        # [keep-alive] Velocidade zero: mantém o Servo dentro do timeout sem
+        # comandar movimento.
+        jog_msg = JointJog()
+        jog_msg.header.stamp = self.get_clock().now().to_msg()
+        jog_msg.header.frame_id = self.base_frame_id
+        jog_msg.joint_names = ['joint_0']
+        jog_msg.velocities = [0.0]
+        self.joint_jog_pub.publish(jog_msg)
+
+    def _republish_gripper_target(self):
+        # [keep-alive] A garra só publicava na troca de estado, o que deixava o
+        # canal mudo (e portanto zerado no dataset) nos primeiros 11-18s de cada
+        # episódio. Repetir o alvo corrente é inócuo: quem move a garra de fato é
+        # a action ParallelGripperCommand, este tópico é a expressão da intenção.
+        self.gripper_target_position_publisher.publish(Float64(data=self._last_gripper_target))
 
     def _joint_state_callback(self, msg: JointState):
         # [ready/sleep command] Mantém a última posição conhecida de cada junta
@@ -491,15 +587,22 @@ class BaseArmController(Node):
         goal_msg = ParallelGripperCommand.Goal()
 
         if self.is_gripper_closed:
-            goal_msg.command.position = [0.0] # 0.0 Fully open
+            target_position = 0.0 # 0.0 Fully open
+            goal_msg.command.position = [target_position]
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
         else:
-            goal_msg.command.position = [0.04] # 0.04 Fully closed
+            target_position = 0.04 # 0.04 Fully closed
+            goal_msg.command.position = [target_position]
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
 
         # Send goal and update state
         self.gripper_action_client.send_goal_async(goal_msg)
         self.is_gripper_closed = not self.is_gripper_closed
+
+        # Publish the target position whenever the gripper state changes
+        # (o keep-alive repete este mesmo valor entre as trocas)
+        self._last_gripper_target = target_position
+        self.gripper_target_position_publisher.publish(Float64(data=target_position))
 
     def _inputs_callback(self, msg: OVR2ROSInputs):
         """
@@ -570,6 +673,11 @@ class BaseArmController(Node):
                 self.first_received_quest_position = None
                 self.first_received_quest_orientation = None
 
+            # [keep-alive] O alvo anterior deixa de valer ao re-ancorar: enquanto o
+            # filtro reenche, o keep-alive deve segurar a pose ATUAL (fallback via
+            # TF) em vez de repetir um alvo obsoleto e puxar o braço para ele.
+            self.last_executed_target_pose = None
+
             # Clear filter history
             self.position_history.clear()
             self.orientation_history.clear()
@@ -635,6 +743,10 @@ class BaseArmController(Node):
                     self.initial_orientation = None
                     self.first_received_quest_position = None
                     self.first_received_quest_orientation = None
+
+                # [keep-alive] Após girar a base, o alvo cartesiano antigo aponta
+                # para outro lugar: invalida para o keep-alive segurar a pose atual.
+                self.last_executed_target_pose = None
 
                 # Limpa o histórico do filtro para garantir uma leitura suave na retomada
                 self.position_history.clear()
