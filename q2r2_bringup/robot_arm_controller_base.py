@@ -1,14 +1,17 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TransformStamped, Point
-from control_msgs.msg import JointJog
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from quest2ros.msg import OVR2ROSInputs
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
+from sensor_msgs.msg import JointState
 from tf2_ros import TransformListener, Buffer
 import numpy as np
 import tf_transformations
-import time
+
+from control_msgs.msg import JointJog
 
 # ROS 2 action client and gripper action message
 from rclpy.action import ActionClient
@@ -93,6 +96,15 @@ class BaseArmController(Node):
         self.is_gripper_closed = False  # Gripper state
         self._was_jogging = False  # Flag para enviar o comando de parada (0.0)
 
+        # [ready/sleep command] Estado da transição suave (waypoints) até uma pose nomeada
+        self.named_pose_joint_names = ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5']
+        self.current_joint_positions = {}  # Preenchido via /joint_states
+        self._pose_transition_timer = None
+        self._pose_transition_step = 0
+        self._pose_transition_total_steps = 0
+        self._pose_transition_start = None
+        self._pose_transition_target = None
+
     def _init_interfaces(self):
         #Initialize publisher,subscriber,TF,gripper
         # Os tópicos do lado do robô (servo, controllers, joint_states) são relativos: sem
@@ -147,6 +159,24 @@ class BaseArmController(Node):
         self.target_pose_publisher = self.create_publisher(PoseStamped, self.robot_target_pose_topic, 10)
 
 
+        # [ready/sleep command] Necessário para saber a posição de junta atual
+        # (ponto de partida da interpolação até a pose alvo)
+        self.joint_state_subscription = self.create_subscription(
+            JointState,
+            'joint_states',
+            self._joint_state_callback,
+            10
+        )
+
+        # [ready/sleep command] Publisher para posições pré-definidas (Sleep / Ready).
+        # Publica no mesmo tópico que o MoveIt Servo usa para o braço, para que
+        # o Rosetta capture o movimento como parte do canal de ação já monitorado.
+        self.joint_trajectory_publisher = self.create_publisher(
+            JointTrajectory,
+            'arm_controller/joint_trajectory',
+            10
+        )
+
         # Cliente para alterar o tipo de comando do MoveIt Servo
         self.servo_type_client = self.create_client(ServoCommandType, 'servo_node/switch_command_type')
 
@@ -155,6 +185,92 @@ class BaseArmController(Node):
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Waiting for gripper action server: {self.gripper_action_topic}")
 
         self.get_logger().info(f'[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Ready to receive {self.quest_pose_topic} and publish to {self.robot_target_pose_topic}')
+
+    def _joint_state_callback(self, msg: JointState):
+        # [ready/sleep command] Mantém a última posição conhecida de cada junta
+        self.current_joint_positions.update(dict(zip(msg.name, msg.position)))
+
+    def _cancel_pose_transition(self):
+        # [ready/sleep command] Interrompe uma transição sleep/ready em andamento,
+        # evitando que ela dispute o tópico com o MoveIt Servo ou com um novo gatilho
+        if self._pose_transition_timer is not None:
+            self._pose_transition_timer.cancel()
+            self._pose_transition_timer = None
+
+    def _go_to_named_pose(self, pose_name: str, duration_sec: float = 3.0, rate_hz: float = 50.0):
+        """
+        [ready/sleep command]
+        Move o braço até uma pose predefinida publicando uma SEQUÊNCIA de
+        waypoints interpolados entre a posição atual das juntas e a pose alvo,
+        em vez de um único salto direto para o destino.
+
+        Motivo: o Rosetta amostra sempre o ponto mais recente publicado em
+        '/arm_controller/joint_trajectory' e mantém esse valor constante até a
+        próxima mensagem (não interpola múltiplos pontos dentro de uma única
+        mensagem). Publicar só o alvo final geraria um degrau abrupto no canal
+        de ação do dataset. Publicando repetidamente, a uma taxa fixa, um ponto
+        intermediário por vez -- igual ao que o MoveIt Servo já faz durante a
+        teleoperação -- o canal de ação evolui suavemente.
+        """
+        if pose_name == "sleep":
+            target_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        elif pose_name == "ready":
+            target_positions = [0.0, 1.04719755, 0.523598776, 0.628318531, 0.0, 0.0]
+        else:
+            return
+
+        try:
+            start_positions = [self.current_joint_positions[name] for name in self.named_pose_joint_names]
+        except KeyError:
+            self.get_logger().error(
+                f"[{self.arm_name.capitalize()} Arm] /joint_states ainda não tem todas as juntas "
+                f"necessárias; não é possível interpolar até {pose_name.upper()}."
+            )
+            return
+
+        # [ready/sleep command] Cancela uma transição anterior (ex: sleep -> ready em sequência)
+        self._cancel_pose_transition()
+
+        self._pose_transition_start = np.array(start_positions)
+        self._pose_transition_target = np.array(target_positions)
+        self._pose_transition_total_steps = max(int(duration_sec * rate_hz), 1)
+        self._pose_transition_step = 0
+        self._pose_transition_period_sec = 1.0 / rate_hz
+
+        self.get_logger().info(
+            f"[{self.arm_name.capitalize()} Arm] Movendo para a posição: {pose_name.upper()} "
+            f"em {self._pose_transition_total_steps} waypoints ({duration_sec:.1f}s)"
+        )
+        self._pose_transition_timer = self.create_timer(
+            self._pose_transition_period_sec, self._publish_next_pose_waypoint
+        )
+
+    def _publish_next_pose_waypoint(self):
+        # [ready/sleep command] Callback do timer: publica o próximo waypoint interpolado
+        self._pose_transition_step += 1
+        t = self._pose_transition_step / self._pose_transition_total_steps
+
+        # Perfil "smoothstep" (quíntico): velocidade e aceleração nulas nas duas
+        # pontas, para não criar um degrau de velocidade em cima do movimento
+        # (teleop ou jog) que estava rolando antes do gatilho, nem ao chegar no alvo.
+        alpha = 10 * t**3 - 15 * t**4 + 6 * t**5
+        interpolated = self._pose_transition_start + alpha * (
+            self._pose_transition_target - self._pose_transition_start
+        )
+
+        trajectory_msg = JointTrajectory()
+        trajectory_msg.header.stamp = self.get_clock().now().to_msg()
+        trajectory_msg.joint_names = self.named_pose_joint_names
+
+        point = JointTrajectoryPoint()
+        point.positions = interpolated.tolist()
+        point.time_from_start = Duration(seconds=self._pose_transition_period_sec).to_msg()
+        trajectory_msg.points.append(point)
+
+        self.joint_trajectory_publisher.publish(trajectory_msg)
+
+        if self._pose_transition_step >= self._pose_transition_total_steps:
+            self._cancel_pose_transition()
 
     def _get_robot_current_pose(self) -> (tuple[tuple[float, float, float], Quaternion]   | tuple[None, None]):
         """
@@ -394,6 +510,10 @@ class BaseArmController(Node):
             self._button_upper_pressed_state = False
         if not hasattr(self, '_button_lower_pressed_state'):
             self._button_lower_pressed_state = False
+        if not hasattr(self, '_button_index_pressed_state'):
+            self._button_index_pressed_state = False
+        if not hasattr(self, '_button_middle_pressed_state'):
+            self._button_middle_pressed_state = False
 
         # ---------------------------------------------------------
         # 1. Upper button: Toggle gripper
@@ -410,6 +530,12 @@ class BaseArmController(Node):
         if msg.button_lower and not self._button_lower_pressed_state:
             # Flip the pose-streaming gate
             self.allow_pose_update = not self.allow_pose_update
+
+            # [ready/sleep command] Se estava em andamento uma transição sleep/ready,
+            # cancela para não disputar '/arm_controller/joint_trajectory' com o
+            # MoveIt Servo quando a teleoperação por pose for retomada
+            if self.allow_pose_update:
+                self._cancel_pose_transition()
 
             # ==============================================================
             # TROCAR O MODO DO MOVEIT SERVO DINAMICAMENTE
@@ -455,6 +581,20 @@ class BaseArmController(Node):
         # 3. Controle Analógico (Roda continuamente)
         # ---------------------------------------------------------
         if not self.allow_pose_update:
+
+            # Como são gatilhos analógicos (float32), consideramos "pressionado" se passar de 0.5
+            is_index_pressed = msg.press_index > 0.5
+            is_middle_pressed = msg.press_middle > 0.5
+
+            # Botão Index -> SLEEP
+            if is_index_pressed and not self._button_index_pressed_state:
+                self._go_to_named_pose("sleep")
+            self._button_index_pressed_state = is_index_pressed
+
+            # Botão Middle -> READY
+            if is_middle_pressed and not self._button_middle_pressed_state:
+                self._go_to_named_pose("ready")
+            self._button_middle_pressed_state = is_middle_pressed
         
             DEADZONE = 0.15 # drift do analógico
             MAX_VELOCITY = 0.8 #  rad/s 
