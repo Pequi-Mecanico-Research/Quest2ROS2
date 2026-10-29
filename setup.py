@@ -28,6 +28,7 @@ setup(
             'CheckTCPconnection = q2r2_bringup.CheckTCPconnection:main',
             'left_arm_controller = q2r2_bringup.left_arm_controller:main',
             'right_arm_controller = q2r2_bringup.right_arm_controller:main',
+            'wait_for_quest = q2r2_bringup.wait_for_quest:main',
         ],
     },
 )

@@ -23,6 +23,9 @@
 	<exec_depend>python3-numpy</exec_depend>
 	<exec_depend>tf_transformations</exec_depend>
 	<exec_depend>launch_ros</exec_depend>
+	<!-- quest_teleop.launch.py -->
+	<exec_depend>ros_tcp_endpoint</exec_depend>
+	<exec_depend>q2r_base_bridge</exec_depend>
 
 	<test_depend>ament_copyright</test_depend>
 	<test_depend>ament_flake8</test_depend>
