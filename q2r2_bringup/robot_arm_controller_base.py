@@ -84,6 +84,10 @@ class BaseArmController(Node):
         self.position_history = deque(maxlen=self.filter_window_size)
         self.orientation_history = deque(maxlen=self.filter_window_size)
 
+        # Se True, o nó sobe com a teleoperação pausada (mesmo estado de apertar o
+        # botão inferior); o primeiro aperto do botão habilita o streaming de poses.
+        self.start_paused = self.declare_parameter("start_paused", True).value
+
     def _init_variables(self):
         #Initial basic parameter
         self.last_pose_stamped_always = None
@@ -92,7 +96,7 @@ class BaseArmController(Node):
         self.first_received_quest_position = None # First Quest controller position
         self.first_received_quest_orientation = None # First Quest controller orientation
         self.current_robot_pose = None  # Current EEF position (from TF)
-        self.allow_pose_update = True   # Enable/disable arm motion (toggled in inputs callback)
+        self.allow_pose_update = not self.start_paused   # Enable/disable arm motion (toggled in inputs callback)
         self.is_gripper_closed = False  # Gripper state
         self._was_jogging = False  # Flag para enviar o comando de parada (0.0)
 
