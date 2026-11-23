@@ -26,6 +26,9 @@
 	<!-- quest_teleop.launch.py -->
 	<exec_depend>ros_tcp_endpoint</exec_depend>
 	<exec_depend>q2r_base_bridge</exec_depend>
+	<!-- record_buttons: serviços do episode_recorder do rosetta -->
+	<exec_depend>std_srvs</exec_depend>
+	<exec_depend>rosetta_interfaces</exec_depend>
 
 	<test_depend>ament_copyright</test_depend>
 	<test_depend>ament_flake8</test_depend>

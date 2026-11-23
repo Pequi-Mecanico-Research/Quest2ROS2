@@ -7,6 +7,7 @@ If the wait times out, the whole launch shuts down.
     ros2 launch q2r2_bringup quest_teleop.launch.py
     ros2 launch q2r2_bringup quest_teleop.launch.py base:=false
     ros2 launch q2r2_bringup quest_teleop.launch.py quest_timeout:=60.0
+    ros2 launch q2r2_bringup quest_teleop.launch.py record_buttons:=false
 """
 
 import os
@@ -59,6 +60,14 @@ def generate_launch_description():
             'q2r_base_bridge', 'q2r_joy_bridge.launch.py',
             condition=IfCondition(LaunchConfiguration('base')),
         ),
+        # Episode recording on the left controller (X start, Y save, index trigger delete).
+        # The task prompt comes from the episode_recorder's default_prompt.
+        Node(
+            package='q2r2_bringup',
+            executable='record_buttons',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('record_buttons')),
+        ),
     ]
 
     def on_wait_exit(event, _context):
@@ -75,6 +84,13 @@ def generate_launch_description():
             default_value='true',
             choices=('true', 'false'),
             description='Also start the Quest -> mobile base joy bridge.',
+        ),
+        DeclareLaunchArgument(
+            'record_buttons',
+            default_value='true',
+            choices=('true', 'false'),
+            description='Control rosetta episode recording with the left controller '
+                        '(X start, Y save, index trigger delete).',
         ),
         DeclareLaunchArgument(
             'quest_topic',
